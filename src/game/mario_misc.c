@@ -23,6 +23,7 @@
 #include "save_file.h"
 #include "skybox.h"
 #include "sound_init.h"
+#include "vr_game.h"
 
 #define TOAD_STAR_1_REQUIREMENT 12
 #define TOAD_STAR_2_REQUIREMENT 25
@@ -420,6 +421,7 @@ Gfx *geo_mario_head_rotation(s32 callContext, struct GraphNode *node, UNUSED Mat
             vec3s_set(bodyState->headAngle, 0, 0, 0);
             vec3s_set(rotNode->rotation, 0, 0, 0);
         }
+        vr_mario_head(node, NULL);
     }
     return NULL;
 }
@@ -445,6 +447,7 @@ Gfx *geo_switch_mario_hand(s32 callContext, struct GraphNode *node, UNUSED Mat4 
                     (bodyState->handState < 2) ? bodyState->handState : MARIO_HAND_FISTS;
             }
         }
+        switchCase->selectedCase = vr_hand_case(switchCase->numCases == 0, switchCase->selectedCase);
     }
     return NULL;
 }

@@ -29,6 +29,7 @@
 #include "engine/graph_node.h"
 #include "level_table.h"
 #include "pc/configfile.h"
+#include "vr_game.h"
 
 #define CBUTTON_MASK (U_CBUTTONS | D_CBUTTONS | L_CBUTTONS | R_CBUTTONS)
 
@@ -3560,6 +3561,7 @@ void update_graph_node_camera(struct GraphNodeCamera *gc) {
     vec3f_copy(gc->pos, gLakituState.pos);
     vec3f_copy(gc->focus, gLakituState.focus);
     zoom_out_if_paused_and_outside(gc);
+    vr_camera_override(gc);
 }
 
 Gfx *geo_camera_main(s32 callContext, struct GraphNode *g, void *context) {

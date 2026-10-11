@@ -12,6 +12,7 @@
 #include "screen_transition.h"
 #include "segment2.h"
 #include "sm64.h"
+#include "pc/vr/vr.h"
 
 u8 sTransitionColorFadeCount[4] = { 0 };
 u16 sTransitionTextureFadeCount[2] = { 0 };
@@ -206,7 +207,28 @@ s32 render_textured_transition(s8 fadeTimer, s8 transTime, struct WarpTransition
     return set_and_reset_transition_fade_timer(fadeTimer, transTime);
 }
 
+// VR: wipes become plain fades that cover the whole view (a shape on the HUD plane would leave
+// the periphery visible).
+static s32 render_vr_fade_transition(s8 fadeTimer, s8 transType, u8 transTime, struct WarpTransitionData *transData) {
+    u8 alpha = set_transition_color_fade_alpha((transType & 1) ? 0 : 1, fadeTimer, transTime);
+    Vtx *verts = vertex_transition_color(transData, alpha);
+
+    if (verts != NULL) {
+        gSPDisplayList(gDisplayListHead++, dl_proj_mtx_fullscreen);
+        gSPMatrix(gDisplayListHead++, gVrFullviewProj, G_MTX_PROJECTION | G_MTX_LOAD | G_MTX_NOPUSH);
+        gDPSetCombineMode(gDisplayListHead++, G_CC_SHADE, G_CC_SHADE);
+        gDPSetRenderMode(gDisplayListHead++, G_RM_AA_XLU_SURF, G_RM_AA_XLU_SURF2);
+        gSPVertex(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(verts), 4, 0);
+        gSPDisplayList(gDisplayListHead++, dl_draw_quad_verts_0123);
+        gSPDisplayList(gDisplayListHead++, dl_screen_transition_end);
+    }
+    return set_and_reset_transition_fade_timer(fadeTimer, transTime);
+}
+
 int render_screen_transition(s8 fadeTimer, s8 transType, u8 transTime, struct WarpTransitionData *transData) {
+    if (vr_enabled()) {
+        return render_vr_fade_transition(fadeTimer, transType, transTime, transData);
+    }
     switch (transType) {
         case WARP_TRANSITION_FADE_FROM_COLOR:
             return render_fade_transition_from_color(fadeTimer, transTime, transData);

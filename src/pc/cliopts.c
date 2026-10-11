@@ -55,6 +55,12 @@ void parse_cli_opts(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--windowed") == 0) // Open game in windowed mode
             gCLIOpts.FullScreen = 2;
 
+        else if (strcmp(argv[i], "--novr") == 0) // Desktop only
+            gCLIOpts.NoVR = 1;
+
+        else if (strcmp(argv[i], "--vrsim") == 0) // VR pipeline without a headset
+            gCLIOpts.VRSim = 1;
+
         else if (strcmp(argv[i], "--cheats") == 0) // Enable cheats menu
             Cheats.EnableCheats = true;
 

@@ -38,6 +38,7 @@
 #ifdef BETTERCAMERA
 #include "bettercamera.h"
 #endif
+#include "vr_game.h"
 
 u32 unused80339F10;
 s8 filler80339F1C[20];
@@ -1325,7 +1326,11 @@ void update_mario_joystick_inputs(struct MarioState *m) {
         m->intendedMag = mag / 8.0f;
     }
 
-    if (m->intendedMag > 0.0f) {
+    if (m->intendedMag > 0.0f && vr_fp_active()) {
+        // first-person VR: the stick moves relative to where the player is looking
+        m->intendedYaw = atan2s(-controller->stickY, controller->stickX) + vr_fp_camera_yaw();
+        m->input |= INPUT_NONZERO_ANALOG;
+    } else if (m->intendedMag > 0.0f) {
 #ifndef BETTERCAMERA
         m->intendedYaw = atan2s(-controller->stickY, controller->stickX) + m->area->camera->yaw;
 #else

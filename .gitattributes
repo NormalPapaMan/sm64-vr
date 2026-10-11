@@ -21,3 +21,8 @@
 *.m64 binary
 *.png binary
 *.aiff binary
+
+# SM64 VR: Windows scripts keep CRLF, DLLs are binary
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.dll binary

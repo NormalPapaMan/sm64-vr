@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <PR/ultratypes.h>
 
 #include "audio/external.h"
@@ -99,6 +100,11 @@ int start_demo(int timer)
 
 s16 level_select_input_loop(void) {
     s32 stageChanged = FALSE;
+
+    // VR test runs: VR_TEST_LEVEL=<level number> preselects a stage (9 = Bob-omb Battlefield)
+    if (getenv("VR_TEST_LEVEL") != NULL) {
+        gCurrLevelNum = atoi(getenv("VR_TEST_LEVEL"));
+    }
 
     // perform the ID updates per each button press.
     if (gPlayer1Controller->buttonPressed & A_BUTTON) {

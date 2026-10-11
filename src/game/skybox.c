@@ -9,6 +9,7 @@
 #include "save_file.h"
 #include "segment2.h"
 #include "sm64.h"
+#include "pc/vr/vr.h"
 
 
 /**
@@ -312,4 +313,81 @@ Gfx *create_skybox_facing_camera(s8 player, s8 background, f32 fov,
     sSkyBoxInfo[player].upperLeftTile = get_top_left_tile_idx(player);
 
     return init_skybox_display_list(player, background, colorIndex);
+}
+
+/**
+ * VR: wrap the skybox tiles around the viewer as a sphere instead of drawing a flat panorama
+ * that follows the screen. Uses the same yaw/pitch -> panorama mapping as the original
+ * (8 columns of 45 degrees, rows of 30 degrees), drawn with the sky projection marker so the
+ * renderer applies the eye's rotation only.
+ */
+#define VR_SKY_SUB 4
+#define VR_SKY_RADIUS 1000.0f
+
+Gfx *create_skybox_vr(s8 background) {
+    s32 tiles = 6 * 8;
+    s32 nv = (VR_SKY_SUB + 1) * (VR_SKY_SUB + 1);
+    Gfx *dlStart = alloc_display_list(sizeof(Gfx) * (12 + tiles * (8 + VR_SKY_SUB * VR_SKY_SUB)));
+    Vtx *verts = alloc_display_list(sizeof(Vtx) * tiles * nv);
+    Gfx *dl = dlStart;
+    s8 colorIndex = 1;
+    u8 *color;
+    s32 row, col, i, j;
+
+    if (dlStart == NULL || verts == NULL) {
+        return NULL;
+    }
+    if (background == 8 && !(save_file_get_star_flags(gCurrSaveFileNum - 1, COURSE_JRB - 1) & 1)) {
+        colorIndex = 0;
+    }
+    color = sSkyboxColors[colorIndex];
+
+    gDPPipeSync(dl++);
+    gSPClearGeometryMode(dl++, G_LIGHTING);
+    gDPSetCombineMode(dl++, G_CC_MODULATERGB, G_CC_MODULATERGB);
+    gSPPerspNormalize(dl++, 0xFFFF);
+    gSPMatrix(dl++, gVrSkyProjMarker, G_MTX_PROJECTION | G_MTX_LOAD | G_MTX_NOPUSH);
+    gSPDisplayList(dl++, dl_skybox_tile_tex_settings);
+
+    for (row = 1; row <= 6; row++) {
+        for (col = 0; col < 8; col++) {
+            s32 tileIndex = row * SKYBOX_COLS + col;
+            const u8 *const texture =
+                (*(SkyboxTexture *) segmented_to_virtual(sSkyboxTextures[background]))[tileIndex];
+            Vtx *v = verts;
+
+            for (j = 0; j <= VR_SKY_SUB; j++) {
+                // panorama y of this vertex row -> pitch (4 panorama units per degree, 480 = horizon)
+                f32 py = SKYBOX_HEIGHT - row * SKYBOX_TILE_HEIGHT - j * (SKYBOX_TILE_HEIGHT / (f32) VR_SKY_SUB);
+                f32 pitch = (py - 480.0f) / 4.0f * (M_PI / 180.0f);
+                for (i = 0; i <= VR_SKY_SUB; i++) {
+                    // panorama x -> yaw (1280 units per turn, x grows to the right)
+                    f32 px = col * SKYBOX_TILE_WIDTH + i * (SKYBOX_TILE_WIDTH / (f32) VR_SKY_SUB);
+                    f32 yaw = (SKYBOX_WIDTH + SCREEN_WIDTH / 2 - px) / SKYBOX_WIDTH * 2.0f * M_PI;
+                    f32 cp = cosf(pitch);
+                    s16 x = (s16) (sinf(yaw) * cp * VR_SKY_RADIUS);
+                    s16 y = (s16) (sinf(pitch) * VR_SKY_RADIUS);
+                    s16 z = (s16) (cosf(yaw) * cp * VR_SKY_RADIUS);
+                    make_vertex(v, j * (VR_SKY_SUB + 1) + i, x, y, z, i * (31 << 5) / VR_SKY_SUB,
+                                j * (31 << 5) / VR_SKY_SUB, color[0], color[1], color[2], 255);
+                }
+            }
+            verts += nv;
+
+            gLoadBlockTexture(dl++, 32, 32, G_IM_FMT_RGBA, texture);
+            gSPVertex(dl++, VIRTUAL_TO_PHYSICAL(v), nv, 0);
+            for (j = 0; j < VR_SKY_SUB; j++) {
+                for (i = 0; i < VR_SKY_SUB; i++) {
+                    s32 v00 = j * (VR_SKY_SUB + 1) + i;
+                    s32 v10 = v00 + 1;
+                    s32 v01 = v00 + (VR_SKY_SUB + 1);
+                    s32 v11 = v01 + 1;
+                    gSP2Triangles(dl++, v00, v01, v11, 0, v00, v11, v10, 0);
+                }
+            }
+        }
+    }
+    gSPDisplayList(dl++, dl_skybox_end);
+    gSPEndDisplayList(dl);
+    return dlStart;
 }

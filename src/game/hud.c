@@ -15,6 +15,7 @@
 #include "save_file.h"
 #include "print.h"
 #include "pc/configfile.h"
+#include "vr_game.h"
 
 /* @file hud.c
  * This file implements HUD rendering and power meter animations.
@@ -471,7 +472,7 @@ void render_hud(void) {
 
         if (hudDisplayFlags & HUD_DISPLAY_FLAG_CAMERA_AND_POWER && configHUD) {
             render_hud_power_meter();
-            render_hud_camera_status();
+            if (!vr_fp_active()) render_hud_camera_status(); // no Lakitu in first-person VR
         }
 
         if (hudDisplayFlags & HUD_DISPLAY_FLAG_TIMER && configHUD) {

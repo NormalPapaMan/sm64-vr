@@ -10,6 +10,7 @@
 #include "rendering_graph_node.h"
 #include "shadow.h"
 #include "sm64.h"
+#include "vr_game.h"
 
 /**
  * This file contains the code that processes the scene graph for rendering.
@@ -317,6 +318,7 @@ static void geo_process_camera(struct GraphNodeCamera *node) {
     gMatStackIndex++;
     mtxf_to_mtx(mtx, gMatStack[gMatStackIndex]);
     gMatStackFixed[gMatStackIndex] = mtx;
+    vr_capture_camera(gMatStack[gMatStackIndex]);
     if (node->fnNode.node.children != 0) {
         gCurGraphNodeCamera = node;
         node->matrixPtr = &gMatStack[gMatStackIndex];
@@ -388,6 +390,14 @@ static void geo_process_rotation(struct GraphNodeRotation *node) {
 
     mtxf_rotate_zxy_and_translate(mtxf, gVec3fZero, node->rotation);
     mtxf_mul(gMatStack[gMatStackIndex + 1], mtxf, gMatStack[gMatStackIndex]);
+    if (vr_hide_rotation_node(node)) {
+        // first-person VR: collapse Mario's head so it doesn't fill the view
+        for (s32 i = 0; i < 3; i++) {
+            gMatStack[gMatStackIndex + 1][i][0] = 0.0f;
+            gMatStack[gMatStackIndex + 1][i][1] = 0.0f;
+            gMatStack[gMatStackIndex + 1][i][2] = 0.0f;
+        }
+    }
     gMatStackIndex++;
     mtxf_to_mtx(mtx, gMatStack[gMatStackIndex]);
     gMatStackFixed[gMatStackIndex] = mtx;
@@ -579,6 +589,7 @@ static void geo_process_animated_part(struct GraphNodeAnimatedPart *node) {
     }
     mtxf_rotate_xyz_and_translate(matrix, translation, rotation);
     mtxf_mul(gMatStack[gMatStackIndex + 1], matrix, gMatStack[gMatStackIndex]);
+    vr_anim_part(gMatStack[gMatStackIndex + 1]);
     gMatStackIndex++;
     mtxf_to_mtx(matrixPtr, gMatStack[gMatStackIndex]);
     gMatStackFixed[gMatStackIndex] = matrixPtr;
@@ -739,6 +750,10 @@ static int obj_is_in_view(struct GraphNodeObject *node, Mat4 matrix) {
     struct GraphNode *geo;
     f32 hScreenEdge;
 
+    if (vr_enabled()) {
+        // The head turns between game ticks, so the game camera's frustum is not the view.
+        return !(node->node.flags & GRAPH_RENDER_INVISIBLE);
+    }
     if (node->node.flags & GRAPH_RENDER_INVISIBLE) {
         return FALSE;
     }
@@ -797,6 +812,7 @@ static void geo_process_object(struct Object *node) {
     s32 hasAnimation = (node->header.gfx.node.flags & GRAPH_RENDER_HAS_ANIMATION) != 0;
 
     if (node->header.gfx.unk18 == gCurGraphNodeRoot->areaIndex) {
+        vr_object_begin(node);
         if (node->header.gfx.throwMatrix != NULL) {
             mtxf_mul(gMatStack[gMatStackIndex + 1], *node->header.gfx.throwMatrix,
                      gMatStack[gMatStackIndex]);
@@ -842,6 +858,7 @@ static void geo_process_object(struct Object *node) {
         gMatStackIndex--;
         gCurAnimType = ANIM_TYPE_NONE;
         node->header.gfx.throwMatrix = NULL;
+        vr_object_end(node);
     }
 }
 

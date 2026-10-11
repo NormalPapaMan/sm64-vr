@@ -27,6 +27,8 @@
 #include "../platform.h"
 #include "../configfile.h"
 #include "../fs/fs.h"
+#include "../vr/vr.h"
+#include "../vr/vr_math.h"
 
 #define SUPPORT_CHECK(x) assert(x)
 
@@ -166,6 +168,26 @@ static struct RenderingState {
 } rendering_state;
 
 struct GfxDimensions gfx_current_dimensions;
+
+// ---- VR stereo state -------------------------------------------------------------------------
+#define VR_NEAR 6.0f        // world units; the game's own near plane (50-100) would clip Mario's arms
+#define VR_HUD_NEAR 0.05f   // meters
+#define VR_HUD_FAR 100.0f
+
+enum { PROJ_NORMAL, PROJ_SKY, PROJ_FULLVIEW };
+
+static struct {
+    bool active;          // currently rendering an eye
+    float fov[4];         // tangents l, r, u, d
+    float persp_E[4][4];  // game view space -> eye space
+    float hud[4][4];      // 320x240-ortho NDC -> eye clip space (head-locked plane)
+    float sky[4][4];      // world direction -> eye clip space (rotation only)
+    float marioOffsetView[3];
+    const void *mlo, *mhi;
+    int projKind;
+    float P_render[4][4]; // projection actually used for clip coordinates
+    float MP_orig[4][4];  // modelview * game projection (for fog)
+} vrr;
 
 static bool dropped_frame;
 
@@ -699,6 +721,39 @@ static void gfx_matrix_mul(float res[4][4], const float a[4][4], const float b[4
     memcpy(res, tmp, sizeof(tmp));
 }
 
+static void gfx_update_mp(void) {
+    float (*mv)[4] = rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1];
+    if (vrr.active) {
+        gfx_matrix_mul(rsp.MP_matrix, mv, vrr.P_render);
+        gfx_matrix_mul(vrr.MP_orig, mv, rsp.P_matrix);
+    } else {
+        gfx_matrix_mul(rsp.MP_matrix, mv, rsp.P_matrix);
+    }
+}
+
+// Turns whatever projection the game loaded into the one for the current eye.
+static void gfx_vr_update_projection(void) {
+    float (*P)[4] = rsp.P_matrix;
+    if (vrr.projKind == PROJ_SKY) {
+        memcpy(vrr.P_render, vrr.sky, sizeof(vrr.P_render));
+    } else if (vrr.projKind == PROJ_FULLVIEW) {
+        memcpy(vrr.P_render, P, sizeof(vrr.P_render));
+    } else if (fabsf(P[2][3] + 1.0f) < 1e-3f && fabsf(P[3][3]) < 1e-3f) {
+        // Perspective (possibly with the camera's screen roll multiplied in, which we drop).
+        float A = P[2][2], B = P[3][2];
+        float far = (fabsf(A + 1.0f) > 1e-6f) ? B / (A + 1.0f) : 20000.0f;
+        if (!(far > VR_NEAR * 2.0f) || far > 1e6f) {
+            far = 20000.0f;
+        }
+        float proj[4][4];
+        vrm_projection(proj, vrr.fov[0], vrr.fov[1], vrr.fov[2], vrr.fov[3], VR_NEAR, far * 1.5f);
+        vrm_mul(vrr.P_render, vrr.persp_E, proj);
+    } else {
+        // Orthographic: HUD, text, menus. Put the 320x240 screen on a plane in front of the eyes.
+        vrm_mul(vrr.P_render, P, vrr.hud);
+    }
+}
+
 static void gfx_sp_matrix(uint8_t parameters, const int32_t *addr) {
     float matrix[4][4];
 #if 0
@@ -718,8 +773,14 @@ static void gfx_sp_matrix(uint8_t parameters, const int32_t *addr) {
     if (parameters & G_MTX_PROJECTION) {
         if (parameters & G_MTX_LOAD) {
             memcpy(rsp.P_matrix, matrix, sizeof(matrix));
+            vrr.projKind = ((const void *) addr == gVrSkyProjMarker) ? PROJ_SKY
+                         : ((const void *) addr == gVrFullviewProj) ? PROJ_FULLVIEW : PROJ_NORMAL;
         } else {
             gfx_matrix_mul(rsp.P_matrix, matrix, rsp.P_matrix);
+            vrr.projKind = PROJ_NORMAL;
+        }
+        if (vrr.active) {
+            gfx_vr_update_projection();
         }
     } else { // G_MTX_MODELVIEW
         if ((parameters & G_MTX_PUSH) && rsp.modelview_matrix_stack_size < 11) {
@@ -727,13 +788,19 @@ static void gfx_sp_matrix(uint8_t parameters, const int32_t *addr) {
             memcpy(rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 2], sizeof(matrix));
         }
         if (parameters & G_MTX_LOAD) {
+            if (vrr.active && (const void *) addr >= vrr.mlo && (const void *) addr < vrr.mhi) {
+                // Mario's own matrices follow the interpolated camera
+                matrix[3][0] += vrr.marioOffsetView[0];
+                matrix[3][1] += vrr.marioOffsetView[1];
+                matrix[3][2] += vrr.marioOffsetView[2];
+            }
             memcpy(rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], matrix, sizeof(matrix));
         } else {
             gfx_matrix_mul(rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], matrix, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1]);
         }
         rsp.lights_changed = 1;
     }
-    gfx_matrix_mul(rsp.MP_matrix, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], rsp.P_matrix);
+    gfx_update_mp();
 }
 
 static void gfx_sp_pop_matrix(uint32_t count) {
@@ -741,13 +808,16 @@ static void gfx_sp_pop_matrix(uint32_t count) {
         if (rsp.modelview_matrix_stack_size > 0) {
             --rsp.modelview_matrix_stack_size;
             if (rsp.modelview_matrix_stack_size > 0) {
-                gfx_matrix_mul(rsp.MP_matrix, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], rsp.P_matrix);
+                gfx_update_mp();
             }
         }
     }
 }
 
 static float gfx_adjust_x_for_aspect_ratio(float x) {
+    if (vrr.active) {
+        return x;
+    }
     return x * (4.0f / 3.0f) / ((float)gfx_current_dimensions.width / (float)gfx_current_dimensions.height);
 }
 
@@ -841,11 +911,20 @@ static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *verti
                 w = 0.001f;
             }
             
+            if (vrr.active) {
+                // Fog keeps using the game's own projection so it looks the same as on the N64
+                const float (*m)[4] = vrr.MP_orig;
+                z = v->ob[0] * m[0][2] + v->ob[1] * m[1][2] + v->ob[2] * m[2][2] + m[3][2];
+                w = v->ob[0] * m[0][3] + v->ob[1] * m[1][3] + v->ob[2] * m[2][3] + m[3][3];
+                if (fabsf(w) < 0.001f) {
+                    w = 0.001f;
+                }
+            }
             float winv = 1.0f / w;
             if (winv < 0.0f) {
                 winv = 32767.0f;
             }
-            
+
             float fog_z = z * winv * rsp.fog_mul + rsp.fog_offset;
             if (fog_z < 0) fog_z = 0;
             if (fog_z > 255) fog_z = 255;
@@ -1094,7 +1173,12 @@ static void gfx_calc_and_set_viewport(const Vp_t *viewport) {
     rdp.viewport.y = y;
     rdp.viewport.width = width;
     rdp.viewport.height = height;
-    
+    if (vrr.active) {
+        rdp.viewport.x = rdp.viewport.y = 0;
+        rdp.viewport.width = gfx_current_dimensions.width;
+        rdp.viewport.height = gfx_current_dimensions.height;
+    }
+
     rdp.viewport_or_scissor_changed = true;
 }
 
@@ -1164,7 +1248,12 @@ static void gfx_dp_set_scissor(uint32_t mode, uint32_t ulx, uint32_t uly, uint32
     rdp.scissor.y = y;
     rdp.scissor.width = width;
     rdp.scissor.height = height;
-    
+    if (vrr.active) {
+        rdp.scissor.x = rdp.scissor.y = 0;
+        rdp.scissor.width = gfx_current_dimensions.width;
+        rdp.scissor.height = gfx_current_dimensions.height;
+    }
+        
     rdp.viewport_or_scissor_changed = true;
 }
 
@@ -1382,7 +1471,21 @@ static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lr
     ur->y = ulyf;
     ur->z = -1.0f;
     ur->w = 1.0f;
-    
+
+    bool fullscreen = ulxf <= -0.95f && lrxf >= 0.95f && ulyf >= 0.95f && lryf <= -0.95f;
+    if (vrr.active && !fullscreen) {
+        struct LoadedVertex *corners[4] = { ul, ll, lr, ur };
+        for (int i = 0; i < 4; i++) {
+            struct LoadedVertex *c = corners[i];
+            float x = c->x, y = c->y;
+            c->x = x * vrr.hud[0][0] + y * vrr.hud[1][0] + vrr.hud[3][0];
+            c->y = x * vrr.hud[0][1] + y * vrr.hud[1][1] + vrr.hud[3][1];
+            c->z = x * vrr.hud[0][2] + y * vrr.hud[1][2] + vrr.hud[3][2];
+            c->w = x * vrr.hud[0][3] + y * vrr.hud[1][3] + vrr.hud[3][3];
+            c->clip_rej = 0;
+        }
+    }
+        
     // The coordinates for texture rectangle shall bypass the viewport setting
     struct XYWidthHeight default_viewport = {0, 0, gfx_current_dimensions.width, gfx_current_dimensions.height};
     struct XYWidthHeight viewport_saved = rdp.viewport;
@@ -1817,4 +1920,132 @@ void gfx_shutdown(void) {
         if (gfx_wapi->shutdown) gfx_wapi->shutdown();
         gfx_wapi = NULL;
     }
+}
+
+// ---- VR eye rendering ------------------------------------------------------------------------
+
+static float vr_env(const char *name, float def) {
+    const char *v = getenv(name);
+    return v ? (float) atof(v) : def;
+}
+
+// Builds the per-eye matrices from the committed frame info and the latest tracking.
+static void gfx_vr_setup_eye(int eye, float alpha) {
+    const struct VrFrameInfo *fi = &gVrFrameCommitted;
+    const struct VrTracking *t = &gVrTrack;
+    const float zero[3] = { 0, 0, 0 };
+    float scale = fi->scale > 0 ? fi->scale : 100.0f;
+
+    memcpy(vrr.fov, t->fov[eye], sizeof(vrr.fov));
+
+    float anchor[3];
+    for (int i = 0; i < 3; i++) {
+        anchor[i] = fi->anchorPrev[i] + (fi->anchorCur[i] - fi->anchorPrev[i]) * alpha;
+    }
+
+    // Eye in world space: rotation = eye rotation then yaw; position = scaled offset from the
+    // calibrated head center, rotated by yaw, added to the anchor.
+    VrMat ry, eyeRot, eyeWorld, viewEye;
+    vrm_rot_y(ry, fi->yaw);
+    vrm_from_pose(eyeRot, t->eye[eye].quat, zero);
+    vrm_mul(eyeWorld, eyeRot, ry);
+    float off[3];
+    for (int i = 0; i < 3; i++) {
+        off[i] = (t->eye[eye].pos[i] - gVrHeadCenter[i]) * scale;
+    }
+    vrm_dir(off, off, ry);
+    for (int i = 0; i < 3; i++) {
+        eyeWorld[3][i] = anchor[i] + off[i];
+    }
+    vrm_rigid_inverse(viewEye, eyeWorld);
+
+    VrMat invGame;
+    if (fi->haveCamera) {
+        vrm_inverse(invGame, fi->viewGame);
+    } else {
+        vrm_identity(invGame);
+    }
+    vrm_mul(vrr.persp_E, invGame, viewEye);
+
+    // Sky: rotation only
+    VrMat rotOnly, skyProj;
+    vrm_copy(rotOnly, viewEye);
+    rotOnly[3][0] = rotOnly[3][1] = rotOnly[3][2] = 0;
+    vrm_projection(skyProj, vrr.fov[0], vrr.fov[1], vrr.fov[2], vrr.fov[3], 10.0f, 20000.0f);
+    vrm_mul(vrr.sky, rotOnly, skyProj);
+
+    // HUD / pause menu: the 320x240 screen on the floating panel, which stays put in the room
+    // (the game side moves it only when the player turns well away from it).
+    VrMat S, panelM, eyeM, eyeInv, hudProj;
+    vrm_identity(S);
+    S[0][0] = gVrPanel.halfW;
+    S[1][1] = gVrPanel.halfH;
+    S[2][2] = 0.0f;
+    vr_panel_matrix(panelM);
+    vrm_from_pose(eyeM, t->eye[eye].quat, t->eye[eye].pos);
+    vrm_rigid_inverse(eyeInv, eyeM);
+    vrm_projection(hudProj, vrr.fov[0], vrr.fov[1], vrr.fov[2], vrr.fov[3], VR_HUD_NEAR, VR_HUD_FAR);
+    vrm_mul(vrr.hud, S, panelM);
+    vrm_mul(vrr.hud, vrr.hud, eyeInv);
+    vrm_mul(vrr.hud, vrr.hud, hudProj);
+
+    // Mario's body moves with the interpolated anchor in first person
+    vrr.mlo = vrr.mhi = NULL;
+    vrr.marioOffsetView[0] = vrr.marioOffsetView[1] = vrr.marioOffsetView[2] = 0;
+    if (fi->mode == VR_VIEW_FIRST && fi->haveCamera && fi->marioMtxLo != NULL) {
+        float d[3];
+        for (int i = 0; i < 3; i++) {
+            d[i] = anchor[i] - fi->anchorCur[i];
+        }
+        vrm_dir(vrr.marioOffsetView, d, fi->viewGame);
+        vrr.mlo = fi->marioMtxLo;
+        vrr.mhi = fi->marioMtxHi;
+    }
+}
+
+// Start drawing a display list into the bound framebuffer of size w x h. The overlay renderer
+// shares the GL context, so forget the cached shader / texture / viewport state.
+static void gfx_vr_begin_target(uint32_t w, uint32_t h) {
+    gfx_current_dimensions.width = w;
+    gfx_current_dimensions.height = h;
+    gfx_current_dimensions.aspect_ratio = 4.0f / 3.0f;
+
+    gfx_rapi->unload_shader(rendering_state.shader_program);
+    rendering_state.shader_program = NULL;
+    rdp.textures_changed[0] = rdp.textures_changed[1] = true;
+
+    gfx_sp_reset();
+    gfx_rapi->start_frame();
+    memset(&rendering_state.viewport, 0xFF, sizeof(rendering_state.viewport));
+    memset(&rendering_state.scissor, 0xFF, sizeof(rendering_state.scissor));
+    rdp.viewport.x = rdp.viewport.y = 0;
+    rdp.viewport.width = w;
+    rdp.viewport.height = h;
+    rdp.scissor = rdp.viewport;
+    rdp.viewport_or_scissor_changed = true;
+}
+
+void gfx_vr_render_eye(void *displayList, int eye, float alpha) {
+    uint32_t w, h;
+    vr_eye_size(&w, &h);
+    vr_eye_bind(eye);
+    gfx_vr_setup_eye(eye, alpha);
+    vrr.active = true;
+    vrr.projKind = PROJ_NORMAL;
+    gfx_vr_begin_target(w, h);
+
+    gfx_run_dl((Gfx *) displayList);
+    gfx_flush();
+    gfx_rapi->end_frame();
+    vrr.active = false;
+}
+
+void gfx_vr_render_flat(void *displayList, uint32_t w, uint32_t h) {
+    vrr.active = false;
+    vrr.projKind = PROJ_NORMAL;
+    gfx_vr_begin_target(w, h);
+
+    gfx_run_dl((Gfx *) displayList);
+    gfx_flush();
+    gfx_rapi->end_frame();
 }

@@ -7,6 +7,8 @@ struct PCCLIOptions  {
     unsigned int SkipIntro;
     unsigned int FullScreen;
     unsigned int PoolSize;
+    unsigned int NoVR;
+    unsigned int VRSim;
     char ConfigFile[SYS_MAX_PATH];
     char SavePath[SYS_MAX_PATH];
     char GameDir[SYS_MAX_PATH];

@@ -34,6 +34,8 @@
 #include "game/game_init.h"
 #include "game/main.h"
 #include "game/thread6.h"
+#include "game/vr_game.h"
+#include "vr/vr.h"
 
 #ifdef DISCORDRPC
 #include "pc/discord/discordrpc.h"
@@ -68,10 +70,16 @@ void set_vblank_handler(s32 index, struct VblankHandler *handler, OSMesgQueue *q
 }
 
 static bool inited = false;
+static void *sVrDisplayList; // last finished frame, re-rendered for every eye until the next tick
 
 #include "game/display.h" // for gGlobalTimer
 void send_display_list(struct SPTask *spTask) {
     if (!inited) return;
+    if (vr_enabled()) {
+        vr_game_commit();
+        sVrDisplayList = (void *) spTask->task.t.data_ptr;
+        return;
+    }
     gfx_run((Gfx *)spTask->task.t.data_ptr);
 }
 
@@ -83,17 +91,75 @@ void send_display_list(struct SPTask *spTask) {
 #define SAMPLES_LOW 528
 #endif
 
-void produce_one_frame(void) {
-    gfx_start_frame();
+static void produce_audio(void);
 
+// One 30 Hz game tick: logic, display list, audio.
+static void run_game_tick(void) {
     const f32 master_mod = (f32)configMasterVolume / 127.0f;
     set_sequence_player_volume(SEQ_PLAYER_LEVEL, (f32)configMusicVolume / 127.0f * master_mod);
     set_sequence_player_volume(SEQ_PLAYER_SFX, (f32)configSfxVolume / 127.0f * master_mod);
     set_sequence_player_volume(SEQ_PLAYER_ENV, (f32)configEnvVolume / 127.0f * master_mod);
 
+    vr_game_begin_tick();
     game_loop_one_iteration();
     thread6_rumble_loop(NULL);
+    produce_audio();
+}
 
+void produce_one_frame(void) {
+    gfx_start_frame();
+    run_game_tick();
+    gfx_end_frame();
+}
+
+// VR: the headset sets the pace. The game still ticks at 30 Hz; every headset frame re-renders
+// the latest display list from the current head pose, with the camera interpolated between ticks.
+static void vr_main_loop(void) {
+    const double tick = 1.0 / 30.0;
+    double acc = tick; // run a tick right away
+    while (true) {
+        wm_api->handle_events();
+        if (vr_exit_requested()) game_exit();
+
+        double dt;
+        bool render;
+        if (!vr_frame_begin(&dt, &render)) continue;
+        if (dt > 0.25) dt = 0.25;
+        vr_game_frame(dt);
+
+        acc += dt;
+        bool ticked = false;
+        for (int n = 0; acc >= tick && n < 3; n++) {
+            run_game_tick();
+            acc -= tick;
+            ticked = true;
+        }
+        if (acc > tick) acc = tick;
+
+        // Menus / title: draw the game's own picture once per tick for the floating screen
+        bool screen = gVrFrameCommitted.mode == VR_VIEW_SCREEN;
+        if (screen && ticked && sVrDisplayList != NULL) {
+            vr_screen_capture(sVrDisplayList);
+        }
+
+        bool drew = false;
+        if (render && sVrDisplayList != NULL) {
+            float alpha = (float) (acc / tick);
+            for (int eye = 0; eye < 2; eye++) {
+                if (screen) {
+                    vr_eye_bind(eye);
+                } else {
+                    gfx_vr_render_eye(sVrDisplayList, eye, alpha);
+                }
+                vr_overlay_draw(eye, screen);
+            }
+            drew = true;
+        }
+        vr_frame_end(drew);
+    }
+}
+
+static void produce_audio(void) {
     int samples_left = audio_api->buffered();
     u32 num_audio_samples = samples_left < audio_api->get_desired_buffered() ? SAMPLES_HIGH : SAMPLES_LOW;
     //printf("Audio samples: %d %u\n", samples_left, num_audio_samples);
@@ -108,8 +174,6 @@ void produce_one_frame(void) {
     //printf("Audio samples before submitting: %d\n", audio_api->buffered());
 
     audio_api->play((u8 *)audio_buffer, 2 * num_audio_samples * 4);
-
-    gfx_end_frame();
 }
 
 void audio_shutdown(void) {
@@ -126,6 +190,7 @@ void game_deinit(void) {
     configfile_save(configfile_name());
     controller_shutdown();
     audio_shutdown();
+    vr_shutdown();
     gfx_shutdown();
     inited = false;
 }
@@ -224,6 +289,19 @@ void main_func(void) {
     gfx_init(wm_api, rendering_api, window_title);
     wm_api->set_keyboard_callbacks(keyboard_on_key_down, keyboard_on_key_up, keyboard_on_all_keys_up);
 
+    vr_markers_init();
+    #if defined(RAPI_GL) && defined(_WIN32)
+    if (!gCLIOpts.NoVR) {
+        vr_init(gCLIOpts.VRSim ? VR_MODE_SIM : VR_MODE_OPENXR);
+    }
+    #endif
+    if (vr_enabled()) {
+        // game logic (HUD layout, skybox) keeps seeing a 4:3 screen
+        gfx_current_dimensions.width = 320;
+        gfx_current_dimensions.height = 240;
+        gfx_current_dimensions.aspect_ratio = 4.0f / 3.0f;
+    }
+
     #if defined(AAPI_SDL1) || defined(AAPI_SDL2)
     if (audio_api == NULL && audio_sdl.init()) 
         audio_api = &audio_sdl;
@@ -257,6 +335,9 @@ void main_func(void) {
     emscripten_set_main_loop(em_main_loop, 0, 0);
     request_anim_frame(on_anim_frame);
 #else
+    if (vr_enabled()) {
+        vr_main_loop();
+    }
     while (true) {
         wm_api->main_loop(produce_one_frame);
 #ifdef DISCORDRPC
@@ -268,6 +349,7 @@ void main_func(void) {
 
 int main(int argc, char *argv[]) {
     parse_cli_opts(argc, argv);
+    if (getenv("VR_LEVEL_SELECT") != NULL) gDebugLevelSelect = 1;
     main_func();
     return 0;
 }
